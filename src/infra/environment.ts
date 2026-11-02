@@ -3,15 +3,19 @@
  * Variables read by workers avoid `KEY|PASSWORD|SECRET|TOKEN` in their names because DSH strips credential-shaped variables from child environments.
  * Provides default-path guardrails rather than an OS-level security boundary, as workers run under the operator's OS user.
  */
+import { copyFileSync, readFileSync, realpathSync } from 'node:fs'
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
-import { realpathSync } from 'node:fs'
 import { delimiter, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
+const shimProgram = (): string => join(fileURLToPath(new URL('.', import.meta.url)), '..', '..', 'native', 'build', 'dsh-shim.exe')
+/** True where a `#!/bin/sh` script on PATH cannot run, so each shim is a native launcher that reads `shims.xml` beside it. */
+export const nativeShims = process.platform === 'win32'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
@@ -20,7 +24,14 @@ export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bi
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => `\\${char}`)}"`
-export const credentialHelper = (cli: string): string => `!${shellQuote(cli)} auth git-credential`
+/** Escapes the characters XML reserves, so a Windows path or a message survives being read back by the launcher. */
+const escapeXml = (value: string): string => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;').replaceAll("'", '&apos;')
+/**
+ * The credential helper git runs, which names the CLI as one field so that a path with spaces stays a single word.
+ * POSIX passes it through a shell with `!`; Windows reads it directly, so the quoting there is git's own.
+ */
+export const credentialHelper = (cli: string): string => process.platform === 'win32' ? gitQuote(cli) : `!${shellQuote(cli)}`
 
 export function sameDirectory(a: string, b: string): boolean {
   const real = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
@@ -57,11 +68,16 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
   }
 }
 
-/** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
+/** True when a file is one this project wrote, in its current form or under an earlier name: a POSIX shim carries the marker in its first lines, and a native launcher is the compiled program or a copy of it. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
+  if (nativeShims && file.endsWith('.exe')) return sameFile(file, shimProgram())
   const head = (await readFile(file, 'utf8')).split('\n', 2)
-  return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
+  return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker) || head.some(line => line.includes(marker)))
+}
+/** Compares two files by size and content, so a replaced launcher counts as ours and a foreign program does not. */
+function sameFile(a: string, b: string): boolean {
+  try { return readFileSync(a).equals(readFileSync(b)) } catch { return false }
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
   let foreign = false
@@ -82,8 +98,23 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   await mkdir(dir, { recursive: true })
   const before = await readdir(dir)
   for (const name of before) { const file = join(dir, name); if (!await written(file)) throw new SetupError('foreignFile', { file }) }
-  // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
+  // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command never resolves past the shim directory.
   const kept = new Set<string>()
+  /** Windows cannot run a `#!/bin/sh` script from PATH: each name gets a copy of the launcher and its target comes from `shims.xml`. */
+  const native = async (entries: Array<{ name: string; run?: string; refuse?: string }>): Promise<void> => {
+    const program = shimProgram()
+    const document = ['<?xml version="1.0" encoding="utf-8"?>', `<!-- ${MARKER} -->`, `<shims generated-by="dsh-superagent">`, ...entries.map(entry => entry.run
+      ? `  <shim name="${entry.name}"><run>${escapeXml(entry.run)}</run></shim>`
+      : `  <shim name="${entry.name}"><refuse>${escapeXml(entry.refuse ?? '')}</refuse></shim>`), '</shims>', ''].join('\n')
+    await writeFile(join(dir, 'shims.xml'), document, 'utf8')
+    kept.add('shims.xml')
+    for (const { name } of entries) {
+      const temporary = join(dir, `.${name}.${process.pid}.tmp`)
+      copyFileSync(program, temporary)
+      await rename(temporary, join(dir, `${name}.exe`))
+      kept.add(`${name}.exe`)
+    }
+  }
   const shim = async (name: string, body: string): Promise<void> => {
     const temporary = join(dir, `.${name}.${process.pid}.tmp`)
     await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
@@ -97,10 +128,16 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n')
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+  const blocked = [...new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))]
+    .map(name => ({ name, refuse: `${name} is blocked in this installation; use gh, which acts as ${github.login}.` }))
+  const missingBot = 'lark-cli is unavailable: this installation has no Feishu bot.'
+  const bot: { name: string; run?: string; refuse?: string } = feishu ? { name: 'lark-cli', run: feishu.cli } : { name: 'lark-cli', refuse: missingBot }
+  if (nativeShims) {
+    await native([{ name: 'gh', run: github.cli }, bot, ...blocked])
+  } else {
+    await shim('gh', run(github.cli))
+    await shim('lark-cli', bot.run === undefined ? fail(missingBot) : run(bot.run))
+    for (const entry of blocked) await shim(entry.name, fail(entry.refuse))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [
@@ -108,7 +145,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
     '[user]', '\tuseConfigOnly = true',
     '[credential]', '\thelper =',
-    '[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
+    '[credential "https://github.com"]', `\thelper = ${credentialHelper(github.cli)}`,
     '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/',
     // Include Git LFS filters because the operator's global gitconfig (which usually holds them) is ignored.
     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
