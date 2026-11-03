@@ -21,6 +21,19 @@
 
 #define MAX_SHIM_XML (256 * 1024)
 
+/*
+ * FNV-1a over the mapping. The deployment writes the digest beside the file, and the launcher runs only a mapping whose
+ * digest matches, so a file dropped next to the launcher cannot redirect <run> to another program.
+ */
+static DWORD digest(const char *text, size_t size) {
+    DWORD hash = 2166136261u;
+    for (size_t index = 0; index < size; index++) {
+        hash ^= (unsigned char)text[index];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
 static void fail(wchar_t *format, ...) {
     wchar_t buffer[2048];
     va_list args;
@@ -179,6 +192,26 @@ int wmain(int argc, wchar_t **argv) {
         return 70;
     }
 
+    /* A mapping the deployment did not write must not decide what runs; the digest file travels with it. */
+    wchar_t digest_path[32768];
+    swprintf(digest_path, 32768, L"%ls\\shims.sig", directory);
+    DWORD sig_size = 0;
+    char *sig = slurp(digest_path, &sig_size);
+    if (!sig) {
+        free(xml);
+        fail(L"dsh-shim: %ls is missing; restart dsh-superagent to write it", digest_path);
+        return 70;
+    }
+    char expected[16];
+    snprintf(expected, sizeof expected, "%08lx", (unsigned long)digest(xml, xml_size));
+    int matches = strncmp(sig, expected, 8) == 0;
+    free(sig);
+    if (!matches) {
+        free(xml);
+        fail(L"dsh-shim: %ls does not match its digest; restart dsh-superagent to rewrite it", xml_path);
+        return 70;
+    }
+
     char narrow_name[512];
     WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow_name, sizeof narrow_name, NULL, NULL);
 
@@ -247,28 +280,48 @@ int wmain(int argc, wchar_t **argv) {
     startup.cb = sizeof startup;
     ZeroMemory(&process, sizeof process);
 
-    /* The target may be a .exe or a .cmd/.bat that the deployment names; both go through the same bounded wait. */
-    if (!CreateProcessW(wide, command_line, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process)) {
+    /*
+     * A job object kills the child and everything it started. Terminating only the direct child leaves grandchildren
+     * holding the port or lock it took, so the next worker starts beside them. Create the job before the process and
+     * fail the run rather than fall back to killing one process.
+     */
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+        ZeroMemory(&limits, sizeof limits);
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+    }
+
+    if (!CreateProcessW(wide, command_line, NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, NULL, &startup, &process)) {
         fail(L"dsh-shim: cannot start %ls (%lu)", wide, GetLastError());
+        if (job) CloseHandle(job);
         free(command_line);
         return 1;
     }
     free(command_line);
+    /* A process already in a job that forbids breakaway cannot join ours; it runs as before, so this is best effort. */
+    if (job) AssignProcessToJobObject(job, process.hProcess);
+    ResumeThread(process.hThread);
 
     DWORD limit_ms = 0;
     wchar_t limit[64];
     if (GetEnvironmentVariableW(L"DSH_SHIM_TIMEOUT_MS", limit, 64)) limit_ms = (DWORD)_wtoi(limit);
     DWORD waited = WaitForSingleObject(process.hProcess, limit_ms ? limit_ms : 600000);
     if (waited == WAIT_TIMEOUT) {
-        TerminateProcess(process.hProcess, 124);
+        /* Closing the job kills the child and its descendants; the direct handle is the fallback. */
+        if (job) TerminateJobObject(job, 124);
+        else TerminateProcess(process.hProcess, 124);
         WaitForSingleObject(process.hProcess, 5000);
         fail(L"dsh-shim: %ls exceeded its time limit", wide);
+        if (job) CloseHandle(job);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         return 124;
     }
     DWORD code = 1;
     GetExitCodeProcess(process.hProcess, &code);
+    if (job) CloseHandle(job);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     return (int)code;

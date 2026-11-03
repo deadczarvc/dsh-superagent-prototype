@@ -27,6 +27,12 @@ const gitQuote = (value: string): string => `"${value.replace(/[\\"]/g, char => 
 /** Escapes the characters XML reserves, so a Windows path or a message survives being read back by the launcher. */
 const escapeXml = (value: string): string => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
   .replaceAll('"', '&quot;').replaceAll("'", '&apos;')
+/** FNV-1a as `native/dsh-shim.c` computes it, so the launcher runs only the mapping this process wrote. */
+function fnv1a(text: Buffer): string {
+  let hash = 0x811c9dc5
+  for (const byte of text) { hash = Math.imul(hash ^ byte, 0x01000193) >>> 0 }
+  return hash.toString(16).padStart(8, '0')
+}
 /**
  * The credential helper git runs, which names the CLI as one field so that a path with spaces stays a single word.
  * POSIX passes it through a shell with `!`; Windows reads it directly, so the quoting there is git's own.
@@ -107,7 +113,9 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
       ? `  <shim name="${entry.name}"><run>${escapeXml(entry.run)}</run></shim>`
       : `  <shim name="${entry.name}"><refuse>${escapeXml(entry.refuse ?? '')}</refuse></shim>`), '</shims>', ''].join('\n')
     await writeFile(join(dir, 'shims.xml'), document, 'utf8')
+    await writeFile(join(dir, 'shims.sig'), fnv1a(Buffer.from(document, 'utf8')), 'utf8')
     kept.add('shims.xml')
+    kept.add('shims.sig')
     for (const { name } of entries) {
       const temporary = join(dir, `.${name}.${process.pid}.tmp`)
       copyFileSync(program, temporary)
